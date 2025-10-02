@@ -20,6 +20,18 @@ import CAD_to_OpenMC.assemblymesher as am
 from CAD_to_OpenMC.datadirectory import mesher_datadir
 from CAD_to_OpenMC.check_step import has_degenerate_toroids
 
+
+from OCC.Core.STEPControl import STEPControl_Writer, STEPControl_AsIs
+from OCC.Core.BRepBuilderAPI import BRepBuilderAPI_MakeFace
+from OCC.Core.BRepBuilderAPI import BRepBuilderAPI_Sewing
+from OCC.Core.BRepBuilderAPI import BRepBuilderAPI_MakeSolid
+from OCC.Core.TopoDS import TopoDS_Shell
+from OCC.Core.BRep import BRep_Builder
+from OCC.Core.gp import gp_Pnt
+from OCC.Core.TColgp import TColgp_Array1OfPnt
+from OCC.Core.Poly import Poly_Triangulation
+from OCC.Core.BRepBuilderAPI import BRepBuilderAPI_MakePolygon
+
 try:
     import gmsh
     nogmsh = False
@@ -315,6 +327,63 @@ class H5MTransformer:
                 print(type(entity))
                 return entity
         return None
+
+    def to_step(self, step_filename="output.stp"):
+        
+        root = self.moab_core.get_root_set()
+
+        # Tag for materials
+        mat_tag = self.moab_core.tag_get_handle(
+            "material", size=1, tag_type=types.MB_TYPE_INTEGER, create=False
+        )
+
+        # Collect all surface elements (dim=2)
+        elems = self.moab_core.get_entities_by_dimension(root, 2)
+
+        # Group faces by material
+        material_groups = {}
+
+        for elem in elems:
+            mat_id = int(self.moab_core.tag_get_data(mat_tag, elem)[0])
+            conn = self.moab_core.get_connectivity(elem)
+            coords = self.moab_core.get_coords(conn).reshape(-1, 3)
+
+            if len(coords) == 3:  # triangle
+                faces = [coords]
+            else:  # quad or polygon
+                faces = self._triangulate_polygon(coords)
+
+            if mat_id not in material_groups:
+                material_groups[mat_id] = []
+            material_groups[mat_id].extend(faces)
+
+        solids = []
+        # Build a solid per material
+        for mat_id, faces in material_groups.items():
+            sewing = BRepBuilderAPI_Sewing()
+            for tri in faces:
+                poly = BRepBuilderAPI_MakePolygon()
+                for x, y, z in tri:
+                    poly.Add(gp_Pnt(float(x), float(y), float(z)))
+                poly.Close()
+                face = BRepBuilderAPI_MakeFace(poly.Wire())
+                sewing.Add(face.Face())
+
+            sewing.Perform()
+
+            # Build shell
+            shell = TopoDS_Shell()
+            builder = BRep_Builder()
+            builder.MakeShell(shell)
+            builder.Add(shell, sewing.SewedShape())
+
+            # Build solid
+            solid = BRepBuilderAPI_MakeSolid(shell).Solid()
+            solids.append(cq.Shape(solid))
+
+        # Export all solids as one STEP file
+        cq.exporters.export(solids, step_filename)
+        print(f"STEP file written with {len(solids)} bodies: {step_filename}")
 
     def retag_entity(self, new_material_tag: str, entity_id: int):
         """
