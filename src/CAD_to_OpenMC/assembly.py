@@ -300,18 +300,21 @@ class H5MTransformer:
 
     """
 
-    def __init__(self, h5m_filename: str, verbose: int = 1):
+    def __init__(self, h5m_filepath: str, verbose: int = 1):
         self.verbose = verbose
-        self.existing_h5m_filename = h5m_filename  # Path to the H5M file
-        self.existing_h5m_filepath = os.path.join(os.getcwd(), h5m_filename)
-        self.updated_h5m_filepath = h5m_filename.replace(".h5m", "_updated.h5m")
+        self.existing_h5m_filename = os.path.basename(h5m_filepath)  # Path to the H5M file
+        self.existing_h5m_filepath = h5m_filepath
+        self.h5m_filename = self.existing_h5m_filename.replace(".h5m", "_updated.h5m")
+        self.updated_h5m_filepath = os.path.join(
+            os.path.dirname(h5m_filepath), self.h5m_filename
+        )  # Path to write the updated H5M file
         self.moab_core = core.Core()  # Instance of pyMOAB / MOAB to perform operations
 
     def read_h5m_file_data(self) -> None:
         """
         This method reads the H5M file specified by h5m_filepath.
         """
-        self.moab_core.load_file(self.existing_h5m_filepath)
+        self.moab_core.load_file(str(self.existing_h5m_filepath))
 
     def get_entity_by_id(self, entity_id: int) -> Union[np.uint64 , None]:
         """
@@ -331,11 +334,28 @@ class H5MTransformer:
     def to_step(self, step_filename="output.stp"):
         
         root = self.moab_core.get_root_set()
-
-        # Tag for materials
-        mat_tag = self.moab_core.tag_get_handle(
-            "material", size=1, tag_type=types.MB_TYPE_INTEGER, create=False
-        )
+        # Get all tag handles
+        tag_handles = self.moab_core.tag_get_tags_on_entity(root)
+        if self.verbose > 0:
+            print(f"INFO: Found {len(tag_handles)} tags on root set.")
+            for tag in tag_handles:
+                print(f" - Tag: {tag.get_name()} (type: {tag.get_type()})")
+        else:
+            print(f"INFO: Found {len(tag_handles)} tags on root set.")
+        matterial_tag = None
+        for tag in tag_handles:
+            if "material" in tag.get_name().lower():
+                material_tag = tag
+                break
+        if material_tag is None:
+            print("ERROR: No tag containing 'material' found.")
+        else:
+            print(f"INFO: Found material tag: {material_tag.get_name()} (type: {material_tag.get_type()})")
+        # # Tag for materials
+        # mat_tag = self.moab_core.tag_get_handle(
+        #     "material", size=1, tag_type=types.MB_TYPE_INTEGER, create_if_missing=True, storage_type=types.MB_TAG_SPARSE
+        # )
+        # print(f"Material tag handle: {mat_tag}")
 
         # Collect all surface elements (dim=2)
         elems = self.moab_core.get_entities_by_dimension(root, 2)
@@ -344,7 +364,7 @@ class H5MTransformer:
         material_groups = {}
 
         for elem in elems:
-            mat_id = int(self.moab_core.tag_get_data(mat_tag, elem)[0])
+            mat_id = int(self.moab_core.tag_get_data(material_tag, elem)[0])
             conn = self.moab_core.get_connectivity(elem)
             coords = self.moab_core.get_coords(conn).reshape(-1, 3)
 
@@ -356,7 +376,7 @@ class H5MTransformer:
             if mat_id not in material_groups:
                 material_groups[mat_id] = []
             material_groups[mat_id].extend(faces)
-
+        print(f"INFO: Found {len(material_groups)} unique materials in the mesh.")
         solids = []
         # Build a solid per material
         for mat_id, faces in material_groups.items():
@@ -370,20 +390,26 @@ class H5MTransformer:
                 sewing.Add(face.Face())
 
             sewing.Perform()
-
-            # Build shell
+            # make a shell from the sweved faces
             shell = TopoDS_Shell()
             builder = BRep_Builder()
             builder.MakeShell(shell)
-            builder.Add(shell, sewing.SewedShape())
+            print(f"INFO: Created shell for material {mat_id}")
 
-            # Build solid
-            solid = BRepBuilderAPI_MakeSolid(shell).Solid()
-            solids.append(cq.Shape(solid))
 
-        # Export all solids as one STEP file
-        cq.exporters.export(solids, step_filename)
-        print(f"STEP file written with {len(solids)} bodies: {step_filename}")
+            solid_maker = BRepBuilderAPI_MakeSolid(shell)
+            if solid_maker.IsDone():
+                solid = solid_maker.Solid()
+                solids.append(solid)
+            else:
+                print(f"WARNING: Solid creation failed for material {mat_id}")
+
+        # Export all solids as one STEP
+        assembly = cq.Assembly()
+        for i, solid in enumerate(solids):
+            assembly.add(solid, name=f"Part_{i}")
+        assembly.save(step_filename)
+        print(f"INFO: STEP file written to {step_filename}")
 
     def retag_entity(self, new_material_tag: str, entity_id: int):
         """
@@ -504,6 +530,7 @@ class H5MTransformer:
                 f"INFO: Found {len(matching_entity_ids)} entities for material '{material_tag}'."
             )
         return matching_entity_ids
+
 
 class Assembly:
     """
